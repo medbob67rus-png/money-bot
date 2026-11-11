@@ -233,6 +233,42 @@ def undo(user_id):
     return "Удалил: " + describe(*row[1:])
 
 
+# ───────────────────────── Шаблон «я рб» ─────────────────────────
+
+YA_RB_RE = re.compile(r"^я\s*рб(?![а-яё])\s*(.*)$", re.I | re.S)
+YA_RB_TOOK_RE = re.compile(rf"взял\w*\s*-?\s*({AMOUNT_RE})", re.I)
+YA_RB_CALC_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*-\s*(\d+(?:[.,]\d+)?)")
+
+
+def _num(x):
+    x = round(x, 2)
+    return str(int(x)) if x == int(x) else f"{x:.2f}".rstrip("0")
+
+
+def ya_rb(rest):
+    """«я рб» → готовый шаблон. Числа можно заменить: «я рб взял 30к, 50-10»."""
+    took, a, b = "25к", 42.0, 15.0
+    m = YA_RB_TOOK_RE.search(rest)
+    if m:
+        took = re.sub(r"\s+", "", m.group(1)).lower()
+        rest = rest[: m.start()] + " " + rest[m.end():]
+    m = YA_RB_CALC_RE.search(rest)
+    if m:
+        a = float(m.group(1).replace(",", "."))
+        b = float(m.group(2).replace(",", "."))
+    total = a - b
+    now = datetime.now(TZ)
+    return "\n".join(
+        [
+            f"Я рб — {now:%d.%m}",
+            f"Дата: {now:%d.%m.%Y}",
+            f"Взял −{took}",
+            f"{_num(a)} − {_num(b)} = {_num(total)}",
+            f"Итог: {_num(total)}",
+        ]
+    )
+
+
 # ───────────────────────── Обработка сообщений ─────────────────────────
 
 HELP = (
@@ -242,6 +278,7 @@ HELP = (
     "🤝 Дали в долг: долг Никита 7000\n"
     "↩️ Вернули / вы заняли: долг Никита -7000\n\n"
     "Суммы можно писать как 1500, 1 500, 1.5к или 2 тыс.\n\n"
+    "📝 Шаблон: я рб (или со своими числами: я рб взял 30к, 50-10)\n\n"
     "Команды:\n"
     "/today — итоги за сегодня\n"
     "/week — за неделю\n"
@@ -289,6 +326,11 @@ def handle(user_id, text):
         return history(user_id)
     if action == "undo":
         return undo(user_id)
+
+    # Шаблон «я рб»
+    m = YA_RB_RE.match(text)
+    if m:
+        return ya_rb(m.group(1))
 
     # Долг: «долг Никита 7000 [комментарий]»
     m = DEBT_RE.match(text)
