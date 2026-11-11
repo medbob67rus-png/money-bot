@@ -247,6 +247,9 @@ def _num(x):
     return str(int(x)) if x == int(x) else f"{x:.2f}".rstrip("0")
 
 
+YA_RB_PERSON = "РБ"   # на кого записывается долг из шаблона
+
+
 def ya_rb(rest, user_id=None):
     """«я рб» → готовый шаблон. Числа можно заменить: «я рб взял 30к, 50-10»."""
     took, a, b = "25к", 42.0, 25.0
@@ -261,7 +264,11 @@ def ya_rb(rest, user_id=None):
     total = a - b
     now = datetime.now(TZ)
     if user_id is not None:
-        add_entry(user_id, "rb", total, f"взял −{took}, {_num(a)} − {_num(b)}")
+        if total:
+            add_entry(
+                user_id, "debt", total,
+                f"я рб: взял −{took}, {_num(a)} − {_num(b)}", YA_RB_PERSON,
+            )
     return "\n".join(
         [
             f"Я рб — {now:%d.%m}",
@@ -334,7 +341,12 @@ def handle(user_id, text):
     # Шаблон «я рб»
     m = YA_RB_RE.match(text)
     if m:
-        return ya_rb(m.group(1), user_id) + "\n\n✅ Сохранил в историю"
+        reply = ya_rb(m.group(1), user_id)
+        balance = next(
+            (b for p, b in debt_balances(user_id) if p.lower() == YA_RB_PERSON.lower()), 0
+        )
+        status = debt_line(YA_RB_PERSON, balance) if balance else f"{YA_RB_PERSON}: в расчёте ✅"
+        return f"{reply}\n\n🤝 Записал итог в долги\n{status}"
 
     # Долг: «долг Никита 7000 [комментарий]»
     m = DEBT_RE.match(text)
