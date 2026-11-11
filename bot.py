@@ -319,16 +319,94 @@ def ya_rb(rest, user_id=None):
     )
 
 
+# ───────────────────────── Разбор долгов ─────────────────────────
+
+DEBT_HINT = (
+    "Напишите, кто, сколько и за что:\n"
+    "Дима должен мне 100 за кофе\n"
+    "я должен Васе 1500 за обед\n"
+    "Дима отдал мне 100\n"
+    "я отдал Васе 500"
+)
+
+NATURAL_DEBT_RE = re.compile(
+    rf"^(.*?\S)\s+({SIGN_RE})\s*({AMOUNT_RE})(?:\s+(.*))?$", re.I | re.S
+)
+OWE_WORD_RE = re.compile(r"^(долж|задолж)")
+REPAY_WORD_RE = re.compile(r"^(отда|верну|возврат|погас)")
+SKIP_WORDS = {"я", "мне", "долг", "уже", "ещё", "еще", "мой", "свой"}
+
+
+def parse_debt(text):
+    """Возвращает (имя, сумма, за что), "hint" или None.
+
+    Сумма > 0 — должны мне больше (или я вернул), < 0 — наоборот.
+    """
+    low = text.lower()
+    m = NATURAL_DEBT_RE.match(text)
+    if m:
+        head, sign, raw, note = m.group(1), m.group(2), m.group(3), (m.group(4) or "").strip()
+        words = head.split()
+        lows = [w.lower().strip(",.:;!") for w in words]
+        owe = any(OWE_WORD_RE.match(w) for w in lows)
+        repay = any(REPAY_WORD_RE.match(w) for w in lows)
+        plain = lows[0] == "долг" and not owe and not repay
+        if owe or repay or plain:
+            name = " ".join(
+                w.strip(",.:;!")
+                for w, l in zip(words, lows)
+                if l not in SKIP_WORDS and not OWE_WORD_RE.match(l) and not REPAY_WORD_RE.match(l)
+            )
+            if not name:
+                return "hint"
+            amount = parse_amount(raw)
+            i_am = "я" in lows and "мне" not in lows
+            if plain:                      # «долг Дима 100» / «долг Дима -100»
+                amount = -amount if sign == "-" else amount
+            elif repay:                    # «Дима отдал мне 100» / «я отдал Диме 100»
+                amount = amount if i_am else -amount
+                note = note or "вернул"
+            else:                          # «Дима должен мне 100» / «я должен Диме 100»
+                amount = -amount if i_am else amount
+            return name, amount, note
+    if low.startswith("долг ") or any(
+        OWE_WORD_RE.match(w) or REPAY_WORD_RE.match(w) for w in low.split()[:3]
+    ):
+        return "hint"
+    return None
+
+
+def _stem(name):
+    """Дима / Диме / Диму → «дим», чтобы падежи считались одним человеком."""
+    n = name.lower().strip()
+    return n[:-1] if len(n) > 3 and n[-1] in "аяеуюыиойь" else n
+
+
+def resolve_person(user_id, name):
+    """Если такой человек уже есть в долгах (в любом падеже) — берём его имя."""
+    rows = db.execute(
+        "SELECT person FROM entries WHERE user_id=? AND kind='debt' ORDER BY id",
+        (user_id,),
+    ).fetchall()
+    exact = [p for (p,) in rows if p.lower() == name.lower()]
+    if exact:
+        return exact[0]
+    for (p,) in rows:
+        if _stem(p) == _stem(name):
+            return p
+    return name
+
+
 # ───────────────────────── Обработка сообщений ─────────────────────────
 
 HELP = (
     "Я веду учёт денег. Просто пишите мне:\n\n"
     "💸 Расход: 250 кофе\n"
     "💰 Доход: +50к зарплата\n"
-    "🤝 Мне должны: мне должен Никита 7000 за ремонт\n"
-    "💸 Я должен: я должен Вася 1500 за обед\n"
-    "↩️ Вернули часть: долг Никита -3000 вернул\n"
-    "↩️ Я вернул: долг Вася 1500 вернул\n\n"
+    "🤝 Мне должны: Дима должен мне 100 за кофе\n"
+    "↩️ Мне вернули: Дима отдал мне 100\n"
+    "💸 Я должен: я должен Васе 1500 за обед\n"
+    "↩️ Я вернул: я отдал Васе 500\n\n"
     "Суммы можно писать как 1500, 1 500, 1.5к или 2 тыс.\n\n"
     "📝 Шаблон: я рб (или со своими числами: я рб взял 30к, 50-10)\n\n"
     "Команды:\n"
@@ -389,30 +467,25 @@ def handle(user_id, text):
         status = debt_line(YA_RB_PERSON, balance) if balance else f"{YA_RB_PERSON}: в расчёте ✅"
         return f"{reply}\n\n🤝 Записал итог в долги\n{status}"
 
-    # Долг: «долг Никита 7000 [комментарий]»
-    m = DEBT_RE.match(text)
-    if m:
-        prefix = m.group(1).lower()
-        person, sign, raw, note = m.group(2).strip(), m.group(3), m.group(4), m.group(5) or ""
-        amount = parse_amount(raw)
+    # Долги: «Дима должен мне 100 за кофе», «Дима отдал мне 100», «долг Дима 100»
+    debt = parse_debt(text)
+    if debt == "hint":
+        return DEBT_HINT
+    if debt:
+        person, amount, note = debt
         if amount == 0:
             return "Сумма должна быть больше нуля."
-        if sign == "-":
-            amount = -amount
-        if prefix.startswith("я"):   # «я должен …» — долг мой
-            amount = -amount
-        add_entry(user_id, "debt", amount, note.strip(), person)
-        balance = next(
+        person = resolve_person(user_id, person)
+        before = next(
             (b for p, b in debt_balances(user_id) if p.lower() == person.lower()), 0
         )
-        status = debt_line(person, balance) if balance else f"{person}: в расчёте ✅"
-        return f"Записал: {describe('debt', amount, person, note.strip())}\n{status}"
-    if text.lower().startswith(("долг", "я долж", "мне долж")):
-        return (
-            "Формат: кто, сколько и за что\n"
-            "мне должен Никита 7000 за ремонт\n"
-            "я должен Вася 1500 за обед"
-        )
+        add_entry(user_id, "debt", amount, note, person)
+        balance = round(before + amount, 2)
+        if abs(balance) < 0.005:
+            status = f"{person}: в расчёте ✅"
+        else:
+            status = "Теперь: " + debt_line(person, balance)
+        return f"Записал: {describe('debt', amount, person, note)}\n{status}"
 
     # Расход или доход: «250 кофе», «+50к зарплата», «кофе 250»
     m = EXPENSE_RE.match(text)
