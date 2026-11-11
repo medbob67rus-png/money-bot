@@ -87,7 +87,9 @@ SIGN_RE = r"[+\-]?"
 EXPENSE_RE = re.compile(rf"^({SIGN_RE})\s*({AMOUNT_RE})(?:\s+(.*))?$", re.I | re.S)
 EXPENSE_REV_RE = re.compile(rf"^(.*\S)\s+({SIGN_RE})({AMOUNT_RE})$", re.I | re.S)
 DEBT_RE = re.compile(
-    rf"^долг\s+(.+?)\s+({SIGN_RE})\s*({AMOUNT_RE})(?:\s+(.*))?$", re.I | re.S
+    rf"^(долг|мне\s+долж(?:ен|на|ны)|я\s+долж(?:ен|на))\s+"
+    rf"(.+?)\s+({SIGN_RE})\s*({AMOUNT_RE})(?:\s+(.*))?$",
+    re.I | re.S,
 )
 
 
@@ -181,18 +183,55 @@ def debt_line(person, balance):
     return f"Вы → {person}: {money(-balance)}"
 
 
+def open_debts(user_id):
+    """Незакрытые долги: [(имя, баланс, [(ts, сумма, за что), ...])].
+
+    Когда баланс с человеком обнуляется, старые записи по нему считаются закрытыми.
+    """
+    rows = db.execute(
+        "SELECT ts, person, amount, note FROM entries "
+        "WHERE user_id=? AND kind='debt' ORDER BY id",
+        (user_id,),
+    ).fetchall()
+    people = {}
+    for ts, person, amount, note in rows:
+        p = people.setdefault(person.lower(), {"name": person, "balance": 0.0, "items": []})
+        p["name"] = person
+        p["balance"] = round(p["balance"] + amount, 2)
+        p["items"].append((ts, amount, note))
+        if abs(p["balance"]) < 0.005:
+            p["balance"], p["items"] = 0.0, []
+    return [(p["name"], p["balance"], p["items"]) for p in people.values() if p["balance"]]
+
+
 def debts_report(user_id):
-    balances = debt_balances(user_id)
-    if not balances:
+    debts = open_debts(user_id)
+    if not debts:
         return "🤝 Долгов нет."
-    lines = ["🤝 Долги"]
-    for person, balance in sorted(balances, key=lambda pb: -pb[1]):
-        lines.append("• " + debt_line(person, balance))
-    owed_to_me = sum(b for _, b in balances if b > 0)
-    i_owe = -sum(b for _, b in balances if b < 0)
-    lines.append("")
-    lines.append(f"Вам должны: {money(owed_to_me)}")
-    lines.append(f"Вы должны: {money(i_owe)}")
+
+    def section(title, people, sign):
+        total = sum(abs(b) for _, b, _ in people)
+        out = [f"{title}: {money(total)}"]
+        for name, balance, items in sorted(people, key=lambda p: -abs(p[1])):
+            out.append(f"• {name} — {money(abs(balance))}")
+            for ts, amount, note in items:
+                when = datetime.fromisoformat(ts).strftime("%d.%m")
+                # в разделе «Я должен» знак переворачиваем: + значит «занял ещё»
+                shown = amount * sign
+                mark = "+" if shown > 0 else "−"
+                what = note or ("без описания" if shown > 0 else "возврат")
+                out.append(f"    {when}  {mark}{money(abs(shown))} — {what}")
+        return out
+
+    to_me = [d for d in debts if d[1] > 0]
+    by_me = [d for d in debts if d[1] < 0]
+    lines = []
+    if to_me:
+        lines += section("💰 Мне должны", to_me, 1)
+    if by_me:
+        if lines:
+            lines.append("")
+        lines += section("💸 Я должен", by_me, -1)
     return "\n".join(lines)
 
 
@@ -286,15 +325,17 @@ HELP = (
     "Я веду учёт денег. Просто пишите мне:\n\n"
     "💸 Расход: 250 кофе\n"
     "💰 Доход: +50к зарплата\n"
-    "🤝 Дали в долг: долг Никита 7000\n"
-    "↩️ Вернули / вы заняли: долг Никита -7000\n\n"
+    "🤝 Мне должны: мне должен Никита 7000 за ремонт\n"
+    "💸 Я должен: я должен Вася 1500 за обед\n"
+    "↩️ Вернули часть: долг Никита -3000 вернул\n"
+    "↩️ Я вернул: долг Вася 1500 вернул\n\n"
     "Суммы можно писать как 1500, 1 500, 1.5к или 2 тыс.\n\n"
     "📝 Шаблон: я рб (или со своими числами: я рб взял 30к, 50-10)\n\n"
     "Команды:\n"
     "/today — итоги за сегодня\n"
     "/week — за неделю\n"
     "/month — за месяц\n"
-    "/debts — кто кому должен\n"
+    "/debts — кто, сколько и за что должен\n"
     "/last — последние записи\n"
     "/undo — отменить последнюю запись"
 )
@@ -351,11 +392,14 @@ def handle(user_id, text):
     # Долг: «долг Никита 7000 [комментарий]»
     m = DEBT_RE.match(text)
     if m:
-        person, sign, raw, note = m.group(1).strip(), m.group(2), m.group(3), m.group(4) or ""
+        prefix = m.group(1).lower()
+        person, sign, raw, note = m.group(2).strip(), m.group(3), m.group(4), m.group(5) or ""
         amount = parse_amount(raw)
         if amount == 0:
             return "Сумма должна быть больше нуля."
         if sign == "-":
+            amount = -amount
+        if prefix.startswith("я"):   # «я должен …» — долг мой
             amount = -amount
         add_entry(user_id, "debt", amount, note.strip(), person)
         balance = next(
@@ -363,8 +407,12 @@ def handle(user_id, text):
         )
         status = debt_line(person, balance) if balance else f"{person}: в расчёте ✅"
         return f"Записал: {describe('debt', amount, person, note.strip())}\n{status}"
-    if text.lower().startswith("долг"):
-        return "Формат: долг Имя сумма\nНапример: долг Никита 7000"
+    if text.lower().startswith(("долг", "я долж", "мне долж")):
+        return (
+            "Формат: кто, сколько и за что\n"
+            "мне должен Никита 7000 за ремонт\n"
+            "я должен Вася 1500 за обед"
+        )
 
     # Расход или доход: «250 кофе», «+50к зарплата», «кофе 250»
     m = EXPENSE_RE.match(text)
