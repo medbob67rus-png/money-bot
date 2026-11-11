@@ -249,7 +249,7 @@ def _num(x):
 
 def ya_rb(rest, user_id=None):
     """«я рб» → готовый шаблон. Числа можно заменить: «я рб взял 30к, 50-10»."""
-    took, a, b = "25к", 42.0, 15.0
+    took, a, b = "25к", 42.0, 25.0
     m = YA_RB_TOOK_RE.search(rest)
     if m:
         took = re.sub(r"\s+", "", m.group(1)).lower()
