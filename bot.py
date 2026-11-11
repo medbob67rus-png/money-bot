@@ -57,7 +57,7 @@ db.execute(
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         ts      TEXT    NOT NULL,   -- ISO-время записи
-        kind    TEXT    NOT NULL,   -- 'exp' расход, 'inc' доход, 'debt' долг
+        kind    TEXT    NOT NULL,   -- 'exp' расход, 'inc' доход, 'debt' долг, 'rb' шаблон «я рб»
         amount  REAL    NOT NULL,   -- для долга: + мне должны, − я должен
         person  TEXT,               -- только для долгов
         note    TEXT    NOT NULL DEFAULT ''
@@ -201,6 +201,8 @@ def describe(kind, amount, person, note):
         return f"➖ {money(amount)}" + (f" — {note}" if note else "")
     if kind == "inc":
         return f"➕ {money(amount)}" + (f" — {note}" if note else "")
+    if kind == "rb":
+        return f"📝 Я рб — итог {_num(amount)}" + (f" ({note})" if note else "")
     sign = "+" if amount > 0 else "−"
     return f"🤝 {person} {sign}{money(abs(amount))}" + (f" — {note}" if note else "")
 
@@ -245,7 +247,7 @@ def _num(x):
     return str(int(x)) if x == int(x) else f"{x:.2f}".rstrip("0")
 
 
-def ya_rb(rest):
+def ya_rb(rest, user_id=None):
     """«я рб» → готовый шаблон. Числа можно заменить: «я рб взял 30к, 50-10»."""
     took, a, b = "25к", 42.0, 15.0
     m = YA_RB_TOOK_RE.search(rest)
@@ -258,6 +260,8 @@ def ya_rb(rest):
         b = float(m.group(2).replace(",", "."))
     total = a - b
     now = datetime.now(TZ)
+    if user_id is not None:
+        add_entry(user_id, "rb", total, f"взял −{took}, {_num(a)} − {_num(b)}")
     return "\n".join(
         [
             f"Я рб — {now:%d.%m}",
@@ -330,7 +334,7 @@ def handle(user_id, text):
     # Шаблон «я рб»
     m = YA_RB_RE.match(text)
     if m:
-        return ya_rb(m.group(1))
+        return ya_rb(m.group(1), user_id) + "\n\n✅ Сохранил в историю"
 
     # Долг: «долг Никита 7000 [комментарий]»
     m = DEBT_RE.match(text)
