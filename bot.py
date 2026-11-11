@@ -325,6 +325,7 @@ DEBT_HINT = (
     "Напишите, кто, сколько и за что:\n"
     "Дима должен мне 100 за кофе\n"
     "я должен Васе 1500 за обед\n"
+    "я у Димы взял 100\n"
     "Дима отдал мне 100\n"
     "я отдал Васе 500"
 )
@@ -334,7 +335,8 @@ NATURAL_DEBT_RE = re.compile(
 )
 OWE_WORD_RE = re.compile(r"^(долж|задолж)")
 REPAY_WORD_RE = re.compile(r"^(отда|верну|возврат|погас)")
-SKIP_WORDS = {"я", "мне", "долг", "уже", "ещё", "еще", "мой", "свой"}
+BORROW_WORD_RE = re.compile(r"^(взя|заня|займ)")
+SKIP_WORDS = {"я", "мне", "у", "меня", "в", "долг", "уже", "ещё", "еще", "мой", "свой"}
 
 
 def parse_debt(text):
@@ -350,18 +352,29 @@ def parse_debt(text):
         lows = [w.lower().strip(",.:;!") for w in words]
         owe = any(OWE_WORD_RE.match(w) for w in lows)
         repay = any(REPAY_WORD_RE.match(w) for w in lows)
-        plain = lows[0] == "долг" and not owe and not repay
-        if owe or repay or plain:
+        # «я у Димы взял 100», «взял у Димы 100», «Дима взял у меня 100», «Дима занял 100»
+        borrow = (
+            not owe and not repay
+            and any(BORROW_WORD_RE.match(w) for w in lows)
+            and ("у" in lows or "я" in lows or "меня" in lows or not BORROW_WORD_RE.match(lows[0]))
+        )
+        plain = lows[0] == "долг" and not owe and not repay and not borrow
+        if owe or repay or plain or borrow:
             name = " ".join(
                 w.strip(",.:;!")
                 for w, l in zip(words, lows)
-                if l not in SKIP_WORDS and not OWE_WORD_RE.match(l) and not REPAY_WORD_RE.match(l)
+                if l not in SKIP_WORDS and not OWE_WORD_RE.match(l)
+                and not REPAY_WORD_RE.match(l) and not (borrow and BORROW_WORD_RE.match(l))
             )
             if not name:
                 return "hint"
             amount = parse_amount(raw)
             i_am = "я" in lows and "мне" not in lows
-            if plain:                      # «долг Дима 100» / «долг Дима -100»
+            if borrow:                     # взял я → должен я; взяли у меня → должны мне
+                they_took = "меня" in lows or ("я" not in lows and "у" not in lows)
+                amount = amount if they_took else -amount
+                note = note or "взял"
+            elif plain:                    # «долг Дима 100» / «долг Дима -100»
                 amount = -amount if sign == "-" else amount
             elif repay:                    # «Дима отдал мне 100» / «я отдал Диме 100»
                 amount = amount if i_am else -amount
@@ -406,6 +419,7 @@ HELP = (
     "🤝 Мне должны: Дима должен мне 100 за кофе\n"
     "↩️ Мне вернули: Дима отдал мне 100\n"
     "💸 Я должен: я должен Васе 1500 за обед\n"
+    "💸 Я взял в долг: я у Димы взял 100\n"
     "↩️ Я вернул: я отдал Васе 500\n\n"
     "Суммы можно писать как 1500, 1 500, 1.5к или 2 тыс.\n\n"
     "📝 Шаблон: я рб (или со своими числами: я рб взял 30к, 50-10)\n\n"
